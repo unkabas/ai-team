@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+# bus — file-based coordination CLI for AI agents.
+# Part of the ai-team template: fork the repo, run ./bus, no install step.
+#
+# All state.json mutations run inside a mkdir mutex (see lib/state.sh) so any
+# number of agents in separate terminals can work concurrently without
+# corrupting shared state or stealing each other's locked tasks.
+
+set -u
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+WS="$ROOT/.agent_workspace"
+export WS
+
+# jq is the one hard dependency.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "bus: requires 'jq' (https://jqlang.github.io/jq/). Install it and retry." >&2
+  exit 1
+fi
+
+# shellcheck source=lib/state.sh
+. "$ROOT/lib/state.sh"
+
+usage() {
+  cat <<'EOF'
+bus — file bus for coordinating AI agents
+
+  ./bus init                              scaffold .agent_workspace + autodetect stack
+  ./bus goal "<what to build>"            set the high-level goal (agents decompose it)
+  ./bus agent <NAME>                      print ready-to-paste init prompt for an agent
+  ./bus plan-claim <agent>                (used by agents) atomically claim goal decomposition
+  ./bus status [--json]                   show tasks by status + lock holders
+  ./bus add-task <title> [desc]           add a task to backlog
+  ./bus claim <agent> [task_id]           lock a backlog task (first free if omitted)
+  ./bus move <agent> <task_id> <status>   transition an owned task
+                                          status: in_progress|review|done|backlog
+  ./bus release <agent> <task_id>         drop your lock; task -> backlog
+  ./bus log <agent> <file> <result...>    append to event_log.md (buslang)
+  ./bus error <agent> <message...>        append a trace to error_dump.md
+  ./bus ask <agent> <target> <q...>       post a question to communication_bus.md
+  ./bus answer <agent> <ref> <text...>    answer a question (ref = e.g. T7 or msg id)
+  ./bus cr <agent> <target> <task> --crit "..." --prop "..."
+                                          critique WITH a proposal (rule: criticize -> propose)
+  ./bus doctor [--fix]                    validate state; --fix reclaims expired leases
+  ./bus help                              this text
+
+Lease: a claimed task auto-frees after lease_ttl seconds if its agent dies
+(see ./bus doctor --fix and the status EXPIRED marker).
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# detect_stack — scan the project root for stack markers. Sets globals
+# DETECT_STACK (markdown bullet list) and DETECT_TEST (suggested test command).
+# Language-agnostic: only reports what it finds, never assumes.
+_ds_add() { DETECT_STACK="${DETECT_STACK}- $1"$'\n'; }
+detect_stack() {
+  DETECT_STACK=""; DETECT_TEST=""
+  [ -f "$ROOT/package.json" ]    && { _ds_add "Node.js (package.json)"; : "${DETECT_TEST:=npm test}"; }
+  { [ -f "$ROOT/requirements.txt" ] || [ -f "$ROOT/pyproject.toml" ] || [ -f "$ROOT/setup.py" ]; } \
+                                 && { _ds_add "Python";                 : "${DETECT_TEST:=pytest}"; }
+  [ -f "$ROOT/go.mod" ]          && { _ds_add "Go (go.mod)";            : "${DETECT_TEST:=go test ./...}"; }
+  [ -f "$ROOT/Cargo.toml" ]      && { _ds_add "Rust (Cargo.toml)";      : "${DETECT_TEST:=cargo test}"; }
+  [ -f "$ROOT/pom.xml" ]         && { _ds_add "Java/Maven (pom.xml)";   : "${DETECT_TEST:=mvn test}"; }
+  { [ -f "$ROOT/build.gradle" ] || [ -f "$ROOT/build.gradle.kts" ]; } \
+                                 && { _ds_add "Java/Kotlin (Gradle)";   : "${DETECT_TEST:=gradle test}"; }
+  [ -f "$ROOT/Gemfile" ]         && { _ds_add "Ruby (Gemfile)";         : "${DETECT_TEST:=bundle exec rspec}"; }
+  [ -f "$ROOT/composer.json" ]   && { _ds_add "PHP (composer.json)";    : "${DETECT_TEST:=composer test}"; }
+  ls "$ROOT"/*.csproj >/dev/null 2>&1 \
+                                 && { _ds_add ".NET (*.csproj)";        : "${DETECT_TEST:=dotnet test}"; }
+}
+
+# Insert/refresh an autodetect block in context.md, bounded by markers so the
+# human-authored parts are never touched. Idempotent across re-runs.
+update_autodetect_block() {
+  local ctx="$WS/context.md" block="$1" tmp
+  [ -f "$ctx" ] || return 0
+  tmp="$ctx.tmp.$$"
+  sed '/<!-- BUS:AUTODETECT:START -->/,/<!-- BUS:AUTODETECT:END -->/d' "$ctx" > "$tmp"
+  {
+    printf '\n<!-- BUS:AUTODETECT:START -->\n'
+    printf '## Автодетект (init) — проверь и поправь\n\n'
+    printf '%s\n' "$block"
+    printf '<!-- BUS:AUTODETECT:END -->\n'
+  } >> "$tmp"
+  mv "$tmp" "$ctx"
+}
+
+cmd_init() {
+  mkdir -p "$WS/.locks"
+  local created=0
+
+  if [ ! -f "$STATE" ]; then
+    cat > "$STATE" <<'EOF'
+{
+  "version": 1,
+  "updated_at": null,
+  "goal": null,
+  "planned": false,
+  "planner": null,
+  "agents": {},
+  "tasks": { "backlog": [], "in_progress": [], "review": [], "done": [] }
+}
+EOF
+    created=1; echo "created state.json"
+  fi
+
+  if [ ! -f "$EVENT_LOG" ]; then
+    cat > "$EVENT_LOG" <<'EOF'
+# event_log.md — append-only journal (buslang)
+# format: <DDThhmm> <agent> ~<file> <result>   e.g. 16T2240 alice ~src/pay.py ok
+EOF
+    created=1; echo "created event_log.md"
+  fi
+
+  if [ ! -f "$COMM_BUS" ]; then
+    cat > "$COMM_BUS" <<'EOF'
+# communication_bus.md — agent-to-agent messages (buslang)
+# Q <from>><to>: question
+# A <from> #<ref>: answer
+# CR <from>><to>#<task>| <critique> |> <proposal>   (criticize -> always propose)
+EOF
+    created=1; echo "created communication_bus.md"
+  fi
+
+  if [ ! -f "$ERROR_DUMP" ]; then
+    cat > "$ERROR_DUMP" <<'EOF'
+# error_dump.md — crash logs / traces so agents don't re-loop on a known bug
+# format: <DDThhmm> <agent> ! <message / trace>
+EOF
+    created=1; echo "created error_dump.md"
+  fi
+
+  [ "$created" = 0 ] && echo "workspace already initialized (nothing overwritten)"
+
+  # --- autodetect stack and write a context.md block (human parts untouched) ---
+  detect_stack
+  local detected="не распознан — впиши стек в context.md вручную"
+  if [ -n "$DETECT_STACK" ]; then
+    detected=$(printf '%s' "$DETECT_STACK" | tr '\n' ' ')
+    update_autodetect_block "$(printf 'Стек:\n%s\nКоманда тестов: %s\n' \
+      "$DETECT_STACK" "${DETECT_TEST:-<впиши>}")"
+  fi
+
+  # --- quickstart ---
+  echo ""
+  echo "✓ workspace готов: .agent_workspace/"
+  echo "  стек: $detected"
+  [ -n "$DETECT_TEST" ] && echo "  тесты: $DETECT_TEST"
+  echo ""
+  echo "Next steps:"
+  echo "  1. ./bus goal \"что хочешь сделать\"      # агенты сами разложат на задачи"
+  echo "  2. ./bus agent alice                     # запусти в N терминалах (копипаст промпта)"
+  echo "  3. ./bus status                          # следи за прогрессом"
+  echo "  (опц.) ./bus add-task ... — завести задачи вручную; допиши context.md"
+  echo "  Подробно: README.md"
+}
+
+# ---------------------------------------------------------------------------
+cmd_status() {
+  require_state || return 1
+  if [ "${1:-}" = "--json" ]; then
+    jq . "$STATE"; return 0
+  fi
+  local now; now=$(now_epoch)
+  jq -r --argjson now "$now" '
+    def line(t): "  " + t.id + "  " + t.title
+      + (if t.owner   then "  @" + t.owner else "" end)
+      + (if t.locked_at != null then
+           "  " + (($now - t.locked_at)|tostring) + "s"
+           + (if ($now - t.locked_at) > t.lease_ttl then "  EXPIRED" else "" end)
+         else "" end);
+    "BACKLOG ("     + (.tasks.backlog|length|tostring)     + ")",
+      (.tasks.backlog[]?     | line(.)),
+    "IN_PROGRESS (" + (.tasks.in_progress|length|tostring) + ")",
+      (.tasks.in_progress[]? | line(.)),
+    "REVIEW ("      + (.tasks.review|length|tostring)      + ")",
+      (.tasks.review[]?      | line(.)),
+    "DONE ("        + (.tasks.done|length|tostring)        + ")",
+      (.tasks.done[]?        | line(.))
+  ' "$STATE"
+}
+
+# ---------------------------------------------------------------------------
+cmd_add_task() {
+  local title="${1:-}" desc="${2:-}"
+  [ -n "$title" ] || { echo "usage: ./bus add-task <title> [desc]" >&2; return 2; }
+  require_state || return 1
+  acquire_lock || return 1
+  local id now rc; id=$(next_task_id); now=$(now_epoch)
+  atomic_jq --arg id "$id" --arg t "$title" --arg d "$desc" --argjson now "$now" '
+    .tasks.backlog += [{
+      id:$id, title:$t, description:$d,
+      owner:null, locked_at:null, lease_ttl:1800, files:[]
+    }] | .updated_at = $now'
+  rc=$?
+  release_lock
+  [ $rc -eq 0 ] && echo "added $id  $title"
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
+cmd_claim() {
+  local agent="${1:-}" id="${2:-}"
+  [ -n "$agent" ] || { echo "usage: ./bus claim <agent> [task_id]" >&2; return 2; }
+  require_state || return 1
+  acquire_lock || return 1
+  local now rc; now=$(now_epoch)
+
+  if [ -z "$id" ]; then
+    # No id: take the first new task from backlog.
+    id=$(jq -r '.tasks.backlog[0].id // empty' "$STATE")
+    if [ -z "$id" ]; then
+      echo "no free tasks in backlog"; release_lock; return 3
+    fi
+  else
+    # Explicit id: claimable only if free (owner==null) in backlog OR review.
+    # (review tasks awaiting a reviewer are free to pick up; in_progress is not.)
+    local found
+    found=$(jq -r --arg id "$id" '
+      [ (.tasks.backlog[], .tasks.review[]) | select(.id==$id and .owner==null) ][0].id // empty' "$STATE")
+    if [ -z "$found" ]; then
+      echo "task $id is not available to claim (taken, unknown, or in progress)" >&2
+      release_lock; return 1
+    fi
+  fi
+
+  # Move the task from whichever bucket holds it into in_progress, owned by agent.
+  atomic_jq --arg id "$id" --arg ag "$agent" --argjson now "$now" '
+    ([.tasks[][]? | select(.id==$id)][0]) as $task
+    | .tasks |= map_values(map(select(.id != $id)))
+    | .tasks.in_progress += [ $task + {owner:$ag, locked_at:$now} ]
+    | .agents[$ag] = {last_seen:$now, current_task:$id}
+    | .updated_at = $now'
+  rc=$?
+  release_lock
+  [ $rc -eq 0 ] && echo "claimed $id by $agent"
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
+cmd_move() {
+  local agent="${1:-}" id="${2:-}" status="${3:-}"
+  [ -n "$agent" ] && [ -n "$id" ] && [ -n "$status" ] || {
+    echo "usage: ./bus move <agent> <task_id> <in_progress|review|done|backlog>" >&2; return 2; }
+  case "$status" in
+    in_progress|review|done|backlog) ;;
+    *) echo "bus: invalid status '$status'" >&2; return 2 ;;
+  esac
+  require_state || return 1
+  acquire_lock || return 1
+  local now owner rc; now=$(now_epoch)
+
+  owner=$(jq -r --arg id "$id" '[.tasks[][]? | select(.id==$id)][0].owner // empty' "$STATE")
+  local exists
+  exists=$(jq -r --arg id "$id" '[.tasks[][]? | select(.id==$id)] | length' "$STATE")
+  if [ "$exists" = "0" ]; then
+    echo "task $id not found" >&2; release_lock; return 1
+  fi
+  if [ -n "$owner" ] && [ "$owner" != "$agent" ]; then
+    echo "task $id is owned by $owner, not $agent" >&2; release_lock; return 1
+  fi
+
+  atomic_jq --arg id "$id" --arg ag "$agent" --arg st "$status" --argjson now "$now" '
+    ([.tasks[][]? | select(.id==$id)][0]) as $task
+    | .tasks |= map_values(map(select(.id != $id)))
+    | ($task + (if $st=="in_progress"
+                then {owner:$ag, locked_at:$now}
+                else {owner:null, locked_at:null} end)) as $t2
+    | .tasks[$st] += [$t2]
+    | .updated_at = $now'
+  rc=$?
+  release_lock
+  [ $rc -eq 0 ] && echo "moved $id -> $status"
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
+cmd_release() {
+  local agent="${1:-}" id="${2:-}"
+  [ -n "$agent" ] && [ -n "$id" ] || { echo "usage: ./bus release <agent> <task_id>" >&2; return 2; }
+  cmd_move "$agent" "$id" backlog
+}
+
+# ---------------------------------------------------------------------------
+_append() {  # _append <file> <line>
+  acquire_lock || return 1
+  printf '%s\n' "$2" >> "$1"
+  release_lock
+}
+
+cmd_log() {
+  local agent="${1:-}" file="${2:-}"; shift 2 2>/dev/null || true
+  local result="$*"
+  [ -n "$agent" ] && [ -n "$file" ] && [ -n "$result" ] || {
+    echo "usage: ./bus log <agent> <file> <result...>" >&2; return 2; }
+  _append "$EVENT_LOG" "$(ts_compact) $agent ~$file $result" && echo "logged"
+}
+
+cmd_error() {
+  local agent="${1:-}"; shift 1 2>/dev/null || true
+  local msg="$*"
+  [ -n "$agent" ] && [ -n "$msg" ] || { echo "usage: ./bus error <agent> <message...>" >&2; return 2; }
+  _append "$ERROR_DUMP" "$(ts_compact) $agent ! $msg" && echo "error recorded"
+}
+
+cmd_ask() {
+  local agent="${1:-}" target="${2:-}"; shift 2 2>/dev/null || true
+  local q="$*"
+  [ -n "$agent" ] && [ -n "$target" ] && [ -n "$q" ] || {
+    echo "usage: ./bus ask <agent> <target> <question...>" >&2; return 2; }
+  _append "$COMM_BUS" "Q $agent>$target: $q" && echo "asked"
+}
+
+cmd_answer() {
+  local agent="${1:-}" ref="${2:-}"; shift 2 2>/dev/null || true
+  local text="$*"
+  [ -n "$agent" ] && [ -n "$ref" ] && [ -n "$text" ] || {
+    echo "usage: ./bus answer <agent> <ref> <text...>" >&2; return 2; }
+  _append "$COMM_BUS" "A $agent #$ref: $text" && echo "answered"
+}
+
+# Critique that REQUIRES a proposal — enforces the team rule "criticize -> propose".
+cmd_cr() {
+  local agent="${1:-}" target="${2:-}" task="${3:-}"; shift 3 2>/dev/null || true
+  local crit="" prop=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --crit) crit="$2"; shift 2 ;;
+      --prop) prop="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$agent" ] && [ -n "$target" ] && [ -n "$task" ] || {
+    echo "usage: ./bus cr <agent> <target> <task> --crit \"...\" --prop \"...\"" >&2; return 2; }
+  if [ -z "$crit" ] || [ -z "$prop" ]; then
+    echo "bus: a critique MUST include a proposal. Rule: criticize -> propose." >&2
+    echo "     both --crit and --prop are required." >&2
+    return 2
+  fi
+  _append "$COMM_BUS" "CR $agent>$target#$task| $crit |> $prop" && echo "critique+proposal posted"
+}
+
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+  require_state || return 1
+  local fix=0; [ "${1:-}" = "--fix" ] && fix=1
+  local now problems=0; now=$(now_epoch)
+
+  # 1. duplicate ids across all buckets
+  local dups
+  dups=$(jq -r '[.tasks[][]?.id] | group_by(.) | map(select(length>1)) | .[][0] // empty' "$STATE" | sort -u)
+  if [ -n "$dups" ]; then
+    echo "PROBLEM: duplicate task ids:"; echo "$dups" | sed 's/^/  /'; problems=1
+  fi
+
+  # 2. in_progress tasks without an owner
+  local orphan
+  orphan=$(jq -r '.tasks.in_progress[]? | select(.owner==null) | .id' "$STATE")
+  if [ -n "$orphan" ]; then
+    echo "PROBLEM: in_progress tasks with no owner:"; echo "$orphan" | sed 's/^/  /'; problems=1
+  fi
+
+  # 3. expired leases
+  local expired
+  expired=$(jq -r --argjson now "$now" '
+    .tasks.in_progress[]? | select(.locked_at != null and ($now - .locked_at) > .lease_ttl)
+    | .id + " @" + (.owner // "?")' "$STATE")
+  if [ -n "$expired" ]; then
+    echo "EXPIRED leases:"; echo "$expired" | sed 's/^/  /'
+    if [ "$fix" = 1 ]; then
+      acquire_lock || return 1
+      atomic_jq --argjson now "$now" '
+        [.tasks.in_progress[] | select(.locked_at != null and ($now - .locked_at) > .lease_ttl)] as $exp
+        | .tasks.in_progress |= map(select(.locked_at == null or ($now - .locked_at) <= .lease_ttl))
+        | .tasks.backlog += ($exp | map(. + {owner:null, locked_at:null}))
+        | .updated_at = $now'
+      release_lock
+      echo "  -> reclaimed to backlog"
+    else
+      echo "  (run ./bus doctor --fix to reclaim them)"
+      problems=1
+    fi
+  fi
+
+  # 4. bus files present
+  local f
+  for f in "$EVENT_LOG" "$COMM_BUS" "$ERROR_DUMP"; do
+    [ -f "$f" ] || { echo "PROBLEM: missing $(basename "$f")"; problems=1; }
+  done
+
+  [ "$problems" = 0 ] && echo "ok: state is healthy"
+  return "$problems"
+}
+
+# Set (or show) the high-level goal. Resets the planned flag so a fresh goal
+# gets decomposed again.
+cmd_goal() {
+  require_state || return 1
+  local text="$*"
+  if [ -z "$text" ]; then
+    jq -r '"goal:    " + (.goal // "(не задана)"),
+           "planned: " + (.planned|tostring)
+           + (if .planner then " by " + .planner else "" end)' "$STATE"
+    return 0
+  fi
+  acquire_lock || return 1
+  atomic_jq --arg g "$text" --argjson now "$(now_epoch)" \
+    '.goal=$g | .planned=false | .planner=null | .updated_at=$now'
+  local rc=$?
+  release_lock
+  [ $rc -eq 0 ] && echo "goal set. Запусти агентов: ./bus agent alice (они сами разложат на задачи)"
+  return $rc
+}
+
+# Atomically claim the right to decompose the goal. Exactly one agent wins:
+# prints the goal text (stdout) and returns 0. Everyone else gets rc 3.
+cmd_plan_claim() {
+  local agent="${1:-}"
+  [ -n "$agent" ] || { echo "usage: ./bus plan-claim <agent>" >&2; return 2; }
+  require_state || return 1
+  acquire_lock || return 1
+  local goal planned
+  goal=$(jq -r '.goal // empty' "$STATE")
+  planned=$(jq -r '.planned // false' "$STATE")
+  if [ -z "$goal" ] || [ "$planned" = "true" ]; then
+    release_lock
+    return 3   # no goal, or someone already planned — caller just starts working
+  fi
+  atomic_jq --arg ag "$agent" --argjson now "$(now_epoch)" \
+    '.planned=true | .planner=$ag | .updated_at=$now'
+  local rc=$?
+  release_lock
+  if [ $rc -eq 0 ]; then
+    printf '%s\n' "$goal"   # stdout = the goal for the planner to decompose
+    return 0
+  fi
+  return $rc
+}
+
+# Print a ready-to-paste init prompt with <NAME> substituted.
+cmd_agent() {
+  local name="${1:-}"
+  [ -n "$name" ] || { echo "usage: ./bus agent <NAME>" >&2; return 2; }
+  case "$name" in
+    *[!A-Za-z0-9_-]*) echo "bus: agent name must match [A-Za-z0-9_-]" >&2; return 2 ;;
+  esac
+  local f="$WS/agent_prompt.md"
+  [ -f "$f" ] || { echo "bus: agent_prompt.md not found — run ./bus init" >&2; return 1; }
+  # Emit only the prompt body (everything after the first '---' separator),
+  # with the name placeholder filled in — copy/paste straight into the agent.
+  awk 'body{print} /^---[[:space:]]*$/{body=1}' "$f" | sed "s/<NAME>/$name/g"
+}
+
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-help}"; shift 2>/dev/null || true
+  case "$cmd" in
+    init)      cmd_init "$@" ;;
+    status)    cmd_status "$@" ;;
+    add-task)  cmd_add_task "$@" ;;
+    claim)     cmd_claim "$@" ;;
+    move)      cmd_move "$@" ;;
+    release)   cmd_release "$@" ;;
+    log)       cmd_log "$@" ;;
+    error)     cmd_error "$@" ;;
+    ask)       cmd_ask "$@" ;;
+    answer)    cmd_answer "$@" ;;
+    cr)        cmd_cr "$@" ;;
+    doctor)    cmd_doctor "$@" ;;
+    goal)      cmd_goal "$@" ;;
+    plan-claim) cmd_plan_claim "$@" ;;
+    agent)     cmd_agent "$@" ;;
+    help|-h|--help) usage ;;
+    *) echo "bus: unknown command '$cmd'" >&2; usage; exit 2 ;;
+  esac
+}
+
+main "$@"

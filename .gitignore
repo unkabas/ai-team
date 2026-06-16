@@ -1,0 +1,6 @@
+# Runtime mutex — never commit live locks
+.agent_workspace/.locks/
+
+# Scratch / temp written by atomic JSON writes
+*.tmp
+.agent_workspace/*.tmp
