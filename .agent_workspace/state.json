@@ -1,9 +1,11 @@
 {
-  "version": 1,
+  "version": 2,
   "updated_at": null,
   "goal": null,
   "planned": false,
   "planner": null,
+  "planned_at": null,
   "agents": {},
+  "mailbox": [],
   "tasks": { "backlog": [], "in_progress": [], "review": [], "done": [] }
 }

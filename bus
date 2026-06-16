@@ -30,15 +30,20 @@ bus — file bus for coordinating AI agents
   ./bus agent <NAME>                      print ready-to-paste init prompt for an agent
   ./bus plan-claim <agent>                (used by agents) atomically claim goal decomposition
   ./bus status [--json]                   show tasks by status + lock holders
-  ./bus add-task <title> [desc]           add a task to backlog
-  ./bus claim <agent> [task_id]           lock a backlog task (first free if omitted)
-  ./bus move <agent> <task_id> <status>   transition an owned task
+  ./bus add-task <title> [desc] [--files "client/ shared/"]
+                                          add a task to backlog (--files = its zone)
+  ./bus claim <agent> [task_id] [--plan "how"]
+                                          lock a task; --plan records your approach
+  ./bus next <agent>                      keep-alive: show active task or claim next free zone
+  ./bus move <agent> <task_id> <status> [--force]
+                                          transition an owned task (--force skips checks)
                                           status: in_progress|review|done|backlog
   ./bus release <agent> <task_id>         drop your lock; task -> backlog
   ./bus log <agent> <file> <result...>    append to event_log.md (buslang)
   ./bus error <agent> <message...>        append a trace to error_dump.md
-  ./bus ask <agent> <target> <q...>       post a question to communication_bus.md
-  ./bus answer <agent> <ref> <text...>    answer a question (ref = e.g. T7 or msg id)
+  ./bus ask <agent> <target> <q...>       ask a question (tracked in mailbox)
+  ./bus answer <agent> <ref> <text...>    answer (ref = M-id or asker's name)
+  ./bus inbox <agent>                     open questions addressed to you
   ./bus cr <agent> <target> <task> --crit "..." --prop "..."
                                           critique WITH a proposal (rule: criticize -> propose)
   ./bus doctor [--fix]                    validate state; --fix reclaims expired leases
@@ -93,12 +98,14 @@ cmd_init() {
   if [ ! -f "$STATE" ]; then
     cat > "$STATE" <<'EOF'
 {
-  "version": 1,
+  "version": 2,
   "updated_at": null,
   "goal": null,
   "planned": false,
   "planner": null,
+  "planned_at": null,
   "agents": {},
+  "mailbox": [],
   "tasks": { "backlog": [], "in_progress": [], "review": [], "done": [] }
 }
 EOF
@@ -183,66 +190,192 @@ cmd_status() {
 
 # ---------------------------------------------------------------------------
 cmd_add_task() {
-  local title="${1:-}" desc="${2:-}"
-  [ -n "$title" ] || { echo "usage: ./bus add-task <title> [desc]" >&2; return 2; }
+  # add-task <title> [desc] [--files "zone1 zone2 ..."]
+  local title="" desc="" files=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --files) files="$2"; shift 2 ;;
+      *) if [ -z "$title" ]; then title="$1"; elif [ -z "$desc" ]; then desc="$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$title" ] || { echo "usage: ./bus add-task <title> [desc] [--files \"client/ shared/\"]" >&2; return 2; }
   require_state || return 1
   acquire_lock || return 1
   local id now rc; id=$(next_task_id); now=$(now_epoch)
-  atomic_jq --arg id "$id" --arg t "$title" --arg d "$desc" --argjson now "$now" '
+  # files string -> JSON array of zone prefixes (safe when empty)
+  local files_json
+  files_json=$(jq -cn --arg f "$files" '$f | split(" ") | map(select(length>0))')
+  atomic_jq --arg id "$id" --arg t "$title" --arg d "$desc" \
+            --argjson files "$files_json" --argjson now "$now" '
     .tasks.backlog += [{
       id:$id, title:$t, description:$d,
-      owner:null, locked_at:null, lease_ttl:1800, files:[]
+      owner:null, locked_at:null, lease_ttl:1800,
+      files:$files, approach:null
     }] | .updated_at = $now'
   rc=$?
   release_lock
-  [ $rc -eq 0 ] && echo "added $id  $title"
+  if [ $rc -eq 0 ]; then
+    echo "added $id  $title"
+    [ -n "$files" ] && echo "  зона: $files"
+  fi
   return $rc
 }
 
 # ---------------------------------------------------------------------------
+# _zone_conflicts <id> <agent> — print active (in_progress) tasks owned by
+# OTHERS whose declared file zones overlap this task's zones. Empty = no clash.
+# Must be called while holding the lock. Tasks with no files never clash.
+_zone_conflicts() {
+  jq -r --arg id "$1" --arg ag "$2" "$JQ_ZONE_DEFS"'
+    ([.tasks[][]? | select(.id==$id)][0].files // []) as $mine
+    | [ .tasks.in_progress[]
+        | select(.owner != $ag and .owner != null)
+        | . as $o | $o.files[]? as $of
+        | select(any($mine[]?; zoverlap(.; $of)))
+        | "\($o.id) @\($o.owner) [\($of)]" ] | unique | .[]' "$STATE"
+}
+
+# _do_claim <id> <agent> <approach> — move task into in_progress owned by agent,
+# recording approach if given (else keeping any prior approach). Holds the lock.
+_do_claim() {
+  local id="$1" ag="$2" ap="$3" now; now=$(now_epoch)
+  atomic_jq --arg id "$id" --arg ag "$ag" --arg ap "$ap" --argjson now "$now" '
+    ([.tasks[][]? | select(.id==$id)][0]) as $task
+    | .tasks |= map_values(map(select(.id != $id)))
+    | .tasks.in_progress += [ $task + {owner:$ag, locked_at:$now}
+        + (if $ap != "" then {approach:$ap} else {} end) ]
+    | .agents[$ag] = {last_seen:$now, current_task:$id}
+    | .updated_at = $now'
+}
+
 cmd_claim() {
-  local agent="${1:-}" id="${2:-}"
-  [ -n "$agent" ] || { echo "usage: ./bus claim <agent> [task_id]" >&2; return 2; }
+  # claim <agent> [task_id] [--plan "how I'll solve it"]
+  local agent="" id="" plan=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan) plan="$2"; shift 2 ;;
+      *) if [ -z "$agent" ]; then agent="$1"; elif [ -z "$id" ]; then id="$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$agent" ] || { echo "usage: ./bus claim <agent> [task_id] [--plan \"...\"]" >&2; return 2; }
   require_state || return 1
   acquire_lock || return 1
-  local now rc; now=$(now_epoch)
+  local rc is_own=0
 
   if [ -z "$id" ]; then
-    # No id: take the first new task from backlog.
     id=$(jq -r '.tasks.backlog[0].id // empty' "$STATE")
     if [ -z "$id" ]; then
       echo "no free tasks in backlog"; release_lock; return 3
     fi
   else
-    # Explicit id: claimable only if free (owner==null) in backlog OR review.
-    # (review tasks awaiting a reviewer are free to pick up; in_progress is not.)
-    local found
-    found=$(jq -r --arg id "$id" '
-      [ (.tasks.backlog[], .tasks.review[]) | select(.id==$id and .owner==null) ][0].id // empty' "$STATE")
-    if [ -z "$found" ]; then
-      echo "task $id is not available to claim (taken, unknown, or in progress)" >&2
-      release_lock; return 1
+    # Re-claiming your OWN active task just updates its approach (after ./bus next).
+    local own
+    own=$(jq -r --arg id "$id" --arg ag "$agent" \
+      '[.tasks.in_progress[] | select(.id==$id and .owner==$ag)][0].id // empty' "$STATE")
+    if [ -n "$own" ]; then
+      is_own=1
+    else
+      local found
+      found=$(jq -r --arg id "$id" '
+        [ (.tasks.backlog[], .tasks.review[]) | select(.id==$id and .owner==null) ][0].id // empty' "$STATE")
+      if [ -z "$found" ]; then
+        echo "task $id is not available to claim (taken, unknown, or in progress)" >&2
+        release_lock; return 1
+      fi
     fi
   fi
 
-  # Move the task from whichever bucket holds it into in_progress, owned by agent.
-  atomic_jq --arg id "$id" --arg ag "$agent" --argjson now "$now" '
-    ([.tasks[][]? | select(.id==$id)][0]) as $task
-    | .tasks |= map_values(map(select(.id != $id)))
-    | .tasks.in_progress += [ $task + {owner:$ag, locked_at:$now} ]
-    | .agents[$ag] = {last_seen:$now, current_task:$id}
-    | .updated_at = $now'
+  # Ownership-map: refuse if this task's zone overlaps another agent's active task.
+  # (Skipped when just updating your own task.)
+  local conflicts=""
+  [ "$is_own" = 0 ] && conflicts=$(_zone_conflicts "$id" "$agent")
+  if [ -n "$conflicts" ]; then
+    echo "bus: zone conflict — $id пересекается по файлам с активной задачей:" >&2
+    echo "$conflicts" | sed 's/^/  /' >&2
+    echo "  возьми другую задачу или дождись освобождения зоны (./bus status)" >&2
+    release_lock; return 4
+  fi
+
+  _do_claim "$id" "$agent" "$plan"
   rc=$?
   release_lock
-  [ $rc -eq 0 ] && echo "claimed $id by $agent"
+  if [ $rc -eq 0 ]; then
+    [ "$is_own" = 1 ] && echo "updated $id by $agent" || echo "claimed $id by $agent"
+    if [ -n "$plan" ]; then
+      _append "$EVENT_LOG" "$(ts_compact) $agent ~$id plan: $plan"
+      echo "  подход записан"
+    fi
+  fi
   return $rc
 }
 
 # ---------------------------------------------------------------------------
+# _print_task <id> — compact, token-light task block (staged context loading).
+_print_task() {
+  jq -r --arg id "$1" '
+    ([.tasks[][]? | select(.id==$id)][0]) as $t
+    | "TASK \($t.id)  \($t.title)",
+      "  desc:     \($t.description // "")",
+      "  files:    \(($t.files // []) | join(", "))",
+      "  approach: \($t.approach // "—")"' "$STATE"
+}
+
+# next <agent> — the keep-alive command. Returns the agent's active task, or
+# atomically claims the first backlog task whose zone is free, or points at a
+# review task. One command, one compact block — no need to re-read all files.
+cmd_next() {
+  local agent="${1:-}"
+  [ -n "$agent" ] || { echo "usage: ./bus next <agent>" >&2; return 2; }
+  require_state || return 1
+  acquire_lock || return 1
+
+  # Already working on something? Just show it.
+  local active
+  active=$(jq -r --arg ag "$agent" '[.tasks.in_progress[] | select(.owner==$ag)][0].id // empty' "$STATE")
+  if [ -n "$active" ]; then
+    echo "→ продолжай $active"
+    _print_task "$active"; release_lock; return 0
+  fi
+
+  # Pick the first backlog task whose zone doesn't clash with any active task.
+  local ids id chosen=""
+  ids=$(jq -r '.tasks.backlog[].id' "$STATE")
+  for id in $ids; do
+    if [ -z "$(_zone_conflicts "$id" "$agent")" ]; then chosen="$id"; break; fi
+  done
+  if [ -n "$chosen" ]; then
+    _do_claim "$chosen" "$agent" ""
+    echo "→ взял $chosen (зона свободна). Зафиксируй подход: ./bus claim $agent $chosen --plan \"...\""
+    _print_task "$chosen"; release_lock; return 0
+  fi
+
+  # No free backlog zone — offer a review task instead (keep-alive).
+  local rev
+  rev=$(jq -r --arg ag "$agent" '[.tasks.review[] | select(.owner==null)][0].id // empty' "$STATE")
+  release_lock
+  if [ -n "$rev" ]; then
+    echo "свободных задач в backlog нет; на ревью ждёт: $rev"
+    echo "взять на ревью: ./bus claim $agent $rev"
+    return 0
+  fi
+  echo "работы нет (backlog пуст, зоны заняты или ревью нет). Жди новых задач."
+  return 3
+}
+
+# ---------------------------------------------------------------------------
 cmd_move() {
-  local agent="${1:-}" id="${2:-}" status="${3:-}"
+  # move <agent> <task_id> <status> [--force]
+  local agent="" id="" status="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *) if [ -z "$agent" ]; then agent="$1"
+         elif [ -z "$id" ]; then id="$1"
+         elif [ -z "$status" ]; then status="$1"; fi; shift ;;
+    esac
+  done
   [ -n "$agent" ] && [ -n "$id" ] && [ -n "$status" ] || {
-    echo "usage: ./bus move <agent> <task_id> <in_progress|review|done|backlog>" >&2; return 2; }
+    echo "usage: ./bus move <agent> <task_id> <in_progress|review|done|backlog> [--force]" >&2; return 2; }
   case "$status" in
     in_progress|review|done|backlog) ;;
     *) echo "bus: invalid status '$status'" >&2; return 2 ;;
@@ -259,6 +392,18 @@ cmd_move() {
   fi
   if [ -n "$owner" ] && [ "$owner" != "$agent" ]; then
     echo "task $id is owned by $owner, not $agent" >&2; release_lock; return 1
+  fi
+
+  # Don't let an agent finish a task while it owes answers (the alice-ignored-bob bug).
+  if [ "$status" = "done" ] && [ "$force" != 1 ]; then
+    local pending
+    pending=$(jq -r --arg ag "$agent" '[.mailbox[]? | select(.to==$ag and .status=="open")] | length' "$STATE")
+    if [ "$pending" -gt 0 ]; then
+      echo "bus: у $agent $pending неотвеченных вопросов — ответь перед done:" >&2
+      jq -r --arg ag "$agent" '.mailbox[]? | select(.to==$ag and .status=="open") | "  [\(.id)] from \(.from): \(.text)"' "$STATE" >&2
+      echo "  ответь (./bus answer $agent <M-id> \"...\") или обойди: ./bus move $agent $id done --force" >&2
+      release_lock; return 5
+    fi
   fi
 
   atomic_jq --arg id "$id" --arg ag "$agent" --arg st "$status" --argjson now "$now" '
@@ -309,15 +454,52 @@ cmd_ask() {
   local q="$*"
   [ -n "$agent" ] && [ -n "$target" ] && [ -n "$q" ] || {
     echo "usage: ./bus ask <agent> <target> <question...>" >&2; return 2; }
-  _append "$COMM_BUS" "Q $agent>$target: $q" && echo "asked"
+  require_state || return 1
+  acquire_lock || return 1
+  local mid now rc; mid=$(next_msg_id); now=$(now_epoch)
+  atomic_jq --arg id "$mid" --arg f "$agent" --arg t "$target" --arg q "$q" --argjson now "$now" '
+    .mailbox += [{id:$id, from:$f, to:$t, text:$q, status:"open", ts:$now}] | .updated_at=$now'
+  rc=$?
+  [ $rc -eq 0 ] && printf '%s\n' "Q $agent>$target [$mid]: $q" >> "$COMM_BUS"
+  release_lock
+  [ $rc -eq 0 ] && echo "asked ($mid) — $target должен ответить: ./bus answer $target $mid \"...\""
+  return $rc
 }
 
+# answer <agent> <ref> <text...> — ref = message id (M-NNN) or the asker's name.
+# Closes matching open questions addressed to <agent>.
 cmd_answer() {
   local agent="${1:-}" ref="${2:-}"; shift 2 2>/dev/null || true
   local text="$*"
   [ -n "$agent" ] && [ -n "$ref" ] && [ -n "$text" ] || {
-    echo "usage: ./bus answer <agent> <ref> <text...>" >&2; return 2; }
-  _append "$COMM_BUS" "A $agent #$ref: $text" && echo "answered"
+    echo "usage: ./bus answer <agent> <ref> <text...>   (ref = M-id или имя спросившего)" >&2; return 2; }
+  require_state || return 1
+  acquire_lock || return 1
+  local now closed rc; now=$(now_epoch)
+  closed=$(jq -r --arg ag "$agent" --arg ref "$ref" '
+    [.mailbox[]? | select(.to==$ag and .status=="open" and (.id==$ref or .from==$ref))] | length' "$STATE")
+  atomic_jq --arg ag "$agent" --arg ref "$ref" --argjson now "$now" '
+    .mailbox |= map(
+      if (.to==$ag and .status=="open" and (.id==$ref or .from==$ref))
+      then .status="answered" else . end)
+    | .updated_at=$now'
+  rc=$?
+  [ $rc -eq 0 ] && printf '%s\n' "A $agent #$ref: $text" >> "$COMM_BUS"
+  release_lock
+  [ $rc -eq 0 ] && echo "answered (закрыто вопросов: $closed)"
+  return $rc
+}
+
+# inbox <agent> — open questions addressed to this agent.
+cmd_inbox() {
+  local agent="${1:-}"
+  [ -n "$agent" ] || { echo "usage: ./bus inbox <agent>" >&2; return 2; }
+  require_state || return 1
+  local out
+  out=$(jq -r --arg ag "$agent" '
+    .mailbox[]? | select(.to==$ag and .status=="open")
+    | "[\(.id)] from \(.from): \(.text)"' "$STATE")
+  if [ -z "$out" ]; then echo "inbox $agent: пусто"; else echo "$out"; fi
 }
 
 # Critique that REQUIRES a proposal — enforces the team rule "criticize -> propose".
@@ -406,7 +588,7 @@ cmd_goal() {
   fi
   acquire_lock || return 1
   atomic_jq --arg g "$text" --argjson now "$(now_epoch)" \
-    '.goal=$g | .planned=false | .planner=null | .updated_at=$now'
+    '.goal=$g | .planned=false | .planner=null | .planned_at=null | .updated_at=$now'
   local rc=$?
   release_lock
   [ $rc -eq 0 ] && echo "goal set. Запусти агентов: ./bus agent alice (они сами разложат на задачи)"
@@ -420,15 +602,28 @@ cmd_plan_claim() {
   [ -n "$agent" ] || { echo "usage: ./bus plan-claim <agent>" >&2; return 2; }
   require_state || return 1
   acquire_lock || return 1
-  local goal planned
+  local goal planned now; now=$(now_epoch)
   goal=$(jq -r '.goal // empty' "$STATE")
   planned=$(jq -r '.planned // false' "$STATE")
+
+  # Empty-plan window fix: if a plan was claimed but produced no tasks and nobody
+  # started working within PLAN_TTL, treat it as failed and let this agent retry.
+  if [ "$planned" = "true" ]; then
+    local backlog inprog planned_at
+    backlog=$(jq -r '.tasks.backlog | length' "$STATE")
+    inprog=$(jq -r '.tasks.in_progress | length' "$STATE")
+    planned_at=$(jq -r '.planned_at // 0' "$STATE")
+    if [ "$backlog" -eq 0 ] && [ "$inprog" -eq 0 ] && [ "$((now - planned_at))" -gt "$PLAN_TTL" ]; then
+      planned=false   # stale empty plan — reclaim
+    fi
+  fi
+
   if [ -z "$goal" ] || [ "$planned" = "true" ]; then
     release_lock
     return 3   # no goal, or someone already planned — caller just starts working
   fi
-  atomic_jq --arg ag "$agent" --argjson now "$(now_epoch)" \
-    '.planned=true | .planner=$ag | .updated_at=$now'
+  atomic_jq --arg ag "$agent" --argjson now "$now" \
+    '.planned=true | .planner=$ag | .planned_at=$now | .updated_at=$now'
   local rc=$?
   release_lock
   if [ $rc -eq 0 ]; then
@@ -460,12 +655,14 @@ main() {
     status)    cmd_status "$@" ;;
     add-task)  cmd_add_task "$@" ;;
     claim)     cmd_claim "$@" ;;
+    next)      cmd_next "$@" ;;
     move)      cmd_move "$@" ;;
     release)   cmd_release "$@" ;;
     log)       cmd_log "$@" ;;
     error)     cmd_error "$@" ;;
     ask)       cmd_ask "$@" ;;
     answer)    cmd_answer "$@" ;;
+    inbox)     cmd_inbox "$@" ;;
     cr)        cmd_cr "$@" ;;
     doctor)    cmd_doctor "$@" ;;
     goal)      cmd_goal "$@" ;;

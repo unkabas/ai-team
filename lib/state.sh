@@ -97,6 +97,27 @@ next_task_id() {
   printf 'T-%03d' "$((max + 1))"
 }
 
+# next_msg_id — first free M-NNN in the mailbox.
+next_msg_id() {
+  local max
+  max=$(jq -r '[.mailbox[]?.id | ltrimstr("M-") | tonumber] | max // 0' "$STATE")
+  printf 'M-%03d' "$((max + 1))"
+}
+
+# Seconds a planner may hold an empty plan before it's considered failed and the
+# right to plan is released to another agent.
+PLAN_TTL=300
+
+# Reusable jq helpers for ownership-map zone overlap. A "zone" is a path prefix
+# (e.g. "client/", "server/src/db", "shared/**"). Two zones conflict when they
+# are equal or one contains the other at a path boundary.
+JQ_ZONE_DEFS='
+  def znorm: rtrimstr("/**") | rtrimstr("/*") | rtrimstr("/");
+  def zoverlap($a; $b):
+    ($a|znorm) as $x | ($b|znorm) as $y
+    | ($x == $y) or ($x | startswith($y + "/")) or ($y | startswith($x + "/"));
+'
+
 require_state() {
   if [ ! -f "$STATE" ]; then
     echo "bus: $STATE not found — run './bus init' first" >&2
